@@ -18240,8 +18240,6 @@ def _selected_profile_snapshot_updates(
     *,
     provider,
     model,
-    base_url=None,
-    no_agent=False,
 ) -> dict[str, str | None]:
     selected_profile = str(profile or "").strip()
     if not selected_profile or (provider is not None and model is not None):
@@ -18251,7 +18249,10 @@ def _selected_profile_snapshot_updates(
         from api.profiles import profile_env_for_background_worker
         from cron.jobs import _compute_provider_model_snapshots
     except Exception:
-        logger.debug("Failed to load cron snapshot repair helpers", exc_info=True)
+        logger.warning(
+            "Selected-profile cron snapshot repair unavailable; saving ambient snapshots",
+            exc_info=True,
+        )
         return {}
 
     try:
@@ -18263,12 +18264,12 @@ def _selected_profile_snapshot_updates(
             provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
                 provider=provider,
                 model=model,
-                base_url=base_url,
-                no_agent=no_agent,
+                base_url=None,
+                no_agent=False,
             )
     except Exception:
-        logger.debug(
-            "Failed to compute selected-profile cron snapshots for %s",
+        logger.warning(
+            "Selected-profile cron snapshot repair failed for %s; saving ambient snapshots",
             selected_profile,
             exc_info=True,
         )

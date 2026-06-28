@@ -272,6 +272,101 @@ def test_cron_create_with_explicit_provider_and_model_skips_snapshot_override(mo
     ]
 
 
+def test_cron_create_with_explicit_provider_recomputes_only_model_snapshot(monkeypatch):
+    import api.profiles as profiles
+    import api.routes as routes
+
+    calls = []
+    profile_events = []
+    created = {
+        "id": "job5130",
+        "name": "Pinned provider job",
+        "prompt": "ping",
+        "schedule": {"kind": "interval", "minutes": 60},
+        "provider": "openai-codex",
+        "provider_snapshot": None,
+        "model_snapshot": "gpt-5.4",
+    }
+
+    cron_jobs = types.ModuleType("cron.jobs")
+    cron_jobs.create_job = lambda **kwargs: calls.append(("create", kwargs)) or dict(created)
+    cron_jobs.update_job = lambda job_id, updates: calls.append(("update", job_id, updates)) or {
+        **created,
+        **updates,
+    }
+
+    def compute_snapshots(*, provider, model, base_url, no_agent):
+        calls.append(
+            (
+                "compute",
+                {
+                    "provider": provider,
+                    "model": model,
+                    "base_url": base_url,
+                    "no_agent": no_agent,
+                },
+            )
+        )
+        return None, "gpt-5.5"
+
+    @contextmanager
+    def fake_profile_env(profile, purpose, logger_override=None):
+        profile_events.append(("enter", profile, purpose, logger_override is routes.logger))
+        yield
+        profile_events.append(("exit", profile, purpose))
+
+    cron_jobs._compute_provider_model_snapshots = compute_snapshots
+
+    monkeypatch.setattr(profiles, "list_profiles_api", lambda: [{"name": "research"}])
+    monkeypatch.setattr(profiles, "profile_env_for_background_worker", fake_profile_env)
+    _install_fake_cron_modules(monkeypatch, cron_jobs)
+
+    handler = _JSONHandler()
+    routes._handle_cron_create(
+        handler,
+        {
+            "name": "Pinned provider job",
+            "prompt": "ping",
+            "schedule": "every 60m",
+            "deliver": "local",
+            "profile": "research",
+            "provider": "openai-codex",
+        },
+    )
+
+    body = _payload(handler)
+    assert handler.status == 200
+    assert body["ok"] is True
+    assert calls == [
+        (
+            "create",
+            {
+                "prompt": "ping",
+                "schedule": "every 60m",
+                "name": "Pinned provider job",
+                "deliver": "local",
+                "skills": [],
+                "model": None,
+                "provider": "openai-codex",
+            },
+        ),
+        (
+            "compute",
+            {
+                "provider": "openai-codex",
+                "model": None,
+                "base_url": None,
+                "no_agent": False,
+            },
+        ),
+        ("update", "job5130", {"profile": "research", "model_snapshot": "gpt-5.5"}),
+    ]
+    assert profile_events == [
+        ("enter", "research", "cron create snapshot", True),
+        ("exit", "research", "cron create snapshot"),
+    ]
+
+
 def test_selected_profile_snapshot_helper_never_repoints_cron_store_globals(monkeypatch):
     import api.profiles as profiles
     from api.routes import _selected_profile_snapshot_updates
