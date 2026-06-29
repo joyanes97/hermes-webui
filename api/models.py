@@ -3476,14 +3476,34 @@ def _sidebar_title_is_generic_webui(title: str | None) -> bool:
     return text.startswith(prefix) and text[len(prefix):].isdigit()
 
 
-def _read_state_db_sidebar_overrides(db_path: Path, session_ids: set[str]) -> dict[str, dict]:
+def _read_state_db_sidebar_overrides(
+    db_path: Path,
+    session_ids: set[str],
+    count_session_ids: set[str] | None = None,
+) -> dict[str, dict]:
     """Return cheap state.db source/title overrides for sidebar rows.
 
     This intentionally does not chase lineage parents/children. It is used on
     the /api/sessions hot path before CLI filtering so state.db can correct
     stale JSON source flags without paying the full lineage-enrichment cost.
+
+    Two-tier cost split (#5132): the ``sessions``-table lookup (source/title/
+    message_count) is an indexed primary-key fetch and is run for ALL
+    ``session_ids`` — its result feeds the source classification that
+    ``/api/sessions`` filters on BEFORE the lazy lineage correction, so capping
+    it would silently drop rows (e.g. a stale ``cli`` JSON row whose state.db
+    source is ``webui``) from the default sidebar. The expensive part is the
+    ``messages`` aggregation (``COUNT(*)``/``MAX(timestamp)`` GROUP BY), which is
+    what blocked /api/sessions for 5-18s on power users; that scan is restricted
+    to ``count_session_ids`` (the top-N paint-priority rows). When
+    ``count_session_ids`` is None, both tiers cover the full set (caller opted
+    out of the cap).
     """
     wanted = {str(sid) for sid in (session_ids or set()) if sid}
+    if count_session_ids is None:
+        count_wanted = set(wanted)
+    else:
+        count_wanted = {str(sid) for sid in count_session_ids if sid} & wanted
     if not wanted or not db_path.exists():
         return {}
     try:
@@ -3549,15 +3569,19 @@ def _read_state_db_sidebar_overrides(db_path: Path, session_ids: set[str]) -> di
                     if entry:
                         overrides[sid] = entry
                 if has_messages_table and messages_has_session_id:
+                    count_chunk = [sid for sid in chunk if sid in count_wanted]
+                    if not count_chunk:
+                        continue
+                    count_placeholders = ','.join('?' * len(count_chunk))
                     last_at_expr = "MAX(timestamp) AS last_message_at" if messages_has_timestamp else "NULL AS last_message_at"
                     cur.execute(
                         f"""
                         SELECT session_id, COUNT(*) AS actual_message_count, {last_at_expr}
                         FROM messages
-                        WHERE session_id IN ({placeholders})
+                        WHERE session_id IN ({count_placeholders})
                         GROUP BY session_id
                         """,
-                        chunk,
+                        count_chunk,
                     )
                     for row in cur.fetchall():
                         sid = str(row['session_id'])
@@ -3582,33 +3606,32 @@ def _read_state_db_sidebar_overrides(db_path: Path, session_ids: set[str]) -> di
 def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
     """Apply state.db source/title overrides without full lineage enrichment.
 
-    Cap the state.db lookup to the top-N most recent sessions to bound
-    wall-clock on power users with thousands of sessions. This mirrors the
-    identical cap on _enrich_sidebar_lineage_metadata (#4638): the caller
-    passes an already pinned-first/newest-first sorted list, the sidebar
-    paints chronologically newest-first, and these source/title corrections
-    only matter for rows the user can actually see. The full scan on every
-    poll is the avoidable cost. Issue #5132 / 2026-06-28 triage:
-    /api/sessions blocked 5-18s in all_sessions.state_db_overrides reading
-    state.db for 2400+ rows on every concurrent poll, flapping the UI to
-    "Connection lost". The cap is env-configurable and fails open.
-
-    Rows beyond the cap keep their JSON source/title (lazily corrected when
-    the user opens the history panel), exactly as with the lineage cap.
+    Source classification (source/title) is corrected for ALL rows because it
+    feeds the CLI/WebUI sidebar filter that runs BEFORE the lazy lineage
+    correction — capping it would silently drop rows whose stale JSON source
+    disagrees with state.db (#5132 regression guard). Only the expensive
+    ``messages`` count/last-message aggregation is capped to the top-N most
+    recent (paint-priority) rows, which is what actually blocked /api/sessions
+    for 5-18s on power users reading state.db for 2400+ rows on every
+    concurrent poll (#5132). The cap is env-configurable and fails open; rows
+    beyond it keep their JSON message-count/last-message until the history panel
+    opens (lazily corrected, exactly as with the lineage cap #4638).
     """
     import os as _os
     try:
         _cap = int(_os.environ.get("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "300"))
     except (TypeError, ValueError):
         _cap = 300
+    all_ids = {str(s.get('session_id')) for s in sessions if s.get('session_id')}
     if _cap > 0 and len(sessions) > _cap:
-        candidates = sessions[:_cap]
+        count_ids = {str(s.get('session_id')) for s in sessions[:_cap] if s.get('session_id')}
     else:
-        candidates = sessions
+        count_ids = None  # cap disabled / under cap -> count every row too
     try:
         metadata = _read_state_db_sidebar_overrides(
             _active_state_db_path(),
-            {str(s.get('session_id')) for s in candidates if s.get('session_id')},
+            all_ids,
+            count_session_ids=count_ids,
         )
     except Exception:
         return
